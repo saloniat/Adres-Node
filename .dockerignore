@@ -1,0 +1,8 @@
+.env
+.gitignore
+*.code-workspace
+privatekey.pem
+node_modules/
+log/
+**/.DS_Store
+.DS_Store

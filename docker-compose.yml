@@ -1,0 +1,42 @@
+version: '3'
+
+services:
+  web:
+    build: .
+    container_name: adres_node
+    restart: always
+      #          enviroment:
+
+    command: npm start
+    volumes:
+      - .:/adres
+    ports:
+      - 3001:3001
+    depends_on:
+      - node_redis_database
+    environment:
+      REDIS_HOST: node_redis_database
+      REDIS_PORT: 6379
+    networks:
+      # - frontend
+      adres_auction_ntwk:
+        ipv4_address: 178.28.0.11
+
+  node_redis_database:
+    container_name: adres_node_redis
+    image: redis:alpine3.16
+    ports:
+      - 8350:6379
+    restart: always
+    networks:
+      - adres_auction_ntwk
+
+networks:
+  adres_auction_ntwk:
+    name: adres_auction_network
+    driver: bridge
+    external: true
+    # ipam:
+    #  config:
+    #    - subnet: 172.28.0.0/16
+    #      gateway: 172.28.0.1

@@ -1,0 +1,735 @@
+/**
+ * This module contains all action related to bid which need a realtime
+ * update at user end. 
+ * Date: Nov 21, 2019
+ * Author: kanhaiya@clavax
+ */ 
+const moment = require('moment'); //for time conversion handling
+const pool = require('../connection');
+const logger = require('../app/logger');
+
+const criticalLimitPercentage = 95;
+
+module.exports = {
+    checkBid: function checkBid(socket, data) {
+		// console.log(data);
+		//first we check if profile id , listing id and auction id exsit in parameter
+		if(data.listingId > 0 && data.profileId > 0 && data.auctionId > 0){
+			
+			try{	
+				//lets authenticate rquest if profile auction is up and profile is registerd for auction
+				let chkQry = "select id from bid_registration where listing_id = "+data.listingId+" and approval_status_id = 1 and profile_id ="+data.profileId;
+				pool.query(chkQry, function (err, checkRes) {
+					
+					if(err){
+						//if error in sql let log query
+						// pool.end();
+						logger.log("error", 'ERROR QUERY : ' + chkQry);
+						socket.emit("checkBid", {"ERROR": err}); 
+						return 0;
+						
+					}
+					else{
+						
+						if(checkRes.rowCount > 0){
+							
+							//This will check bid records and keep bid value in sync
+							let sqlQuery = "select b.bid_amount as  high_bid_amt,b.profile_id_id  as profile_id, total as bid_count,";
+							 sqlQuery += "(select max(max_amount) from bid_max_amount where profile_id = "+data.profileId+" and auction_id="+data.auctionId+")as my_max_bid_amount,";
+							 sqlQuery += "(select max(bid_amount) from bid where profile_id_id = "+data.profileId+" and auction_id_id = "+data.auctionId+") as my_max_bid_val";
+								sqlQuery += " from bid b join auctions a on a.id = b.auction_id_id Join bid_count_view bv on b.listing_id_id = bv.listing_id"; 
+								sqlQuery += " where a.end_date >= now() and a.auction_status_id= 1 ";
+								sqlQuery +=" and bid_type IN('2','3') and is_canceled ='0' and auction_id_id = "+data.auctionId+" and b.listing_id_id = "+data.listingId;
+								sqlQuery += " order by bid_date desc limit 1";
+							
+							 // console.log('Bid sql ==>',sqlQuery);
+								pool.query(sqlQuery, function (err, result) {
+									
+									if(err){
+										//check logger wokring 
+										logger.log("error", 'ERROR QUERY : ' + sqlQuery);
+										socket.emit("checkBid", {"ERROR": err}); 
+										return 0;
+									}
+									else{
+										
+										if(result.rowCount > 0){
+											// console.log(result.rows) //result value
+										   socket.emit("checkBid", result.rows); 	
+										}
+										else{
+											socket.emit("checkBid", {'message': 'No record found','status':404});
+										}	
+									}
+									
+								});
+								
+						}
+						else{
+							socket.emit("checkBid", {'message': 'Bad Request.','status':403});
+						}		
+					}
+			
+					
+				});	//Auth query end
+			}
+			catch(err){
+				 //trapped error
+				  logger.log("error", 'ERROR : ' + err.message);
+				  return 0;
+			 }
+			
+		}
+		else{
+			socket.emit("checkBid", {'message': 'Invalid request.','status':403});
+		}
+    
+	}
+	,
+	addBid: function addBid(socket, data) {
+		 // console.log(data);
+		
+		if(data.listingId && data.profileId && data.auctionId && data.bidAmount){
+				
+				try{
+					//Now authenticate profile against bid registration
+					let chkQry = "select id from bid_registration where listing_id = "+data.listingId+" and approval_status_id = 1 and profile_id ="+data.profileId;
+					// console.log(chkQry);
+					pool.query(chkQry, function (err, checkRes) {
+					
+						if(err){
+							//if error in sql let log query
+							// pool.end(() => {});
+							logger.log("error", 'ERROR QUERY : ' + chkQry);
+							socket.emit("addBid", {"message": "An error occurred that prevented your bid from being placed. Please try again.","status":500}); 
+							return 0;
+						}
+						else{
+							
+							if(checkRes.rowCount > 0){
+								//user found lets proceed 
+								const minBidAmount = parseInt(data.minBidAmount);
+								const newBidAmount = parseInt(data.bidAmount);
+								const bidIncrement = parseInt(data.bidIncrement);
+								let newBidderId = parseInt(data.profileId);
+								let exitingHighBidderId = 0;
+								
+								let existingHighBid = 0; //let get this value from db 
+								let existingProxyAmount =  0; // let get this too from db
+								
+								let startingBid =  0; // let get this too from db
+								let reservePrice =  0; // let get this too from db
+								let currentHighBid = 0;
+								let messageStatus = 0;
+								
+								//Lets check if bid amount is correct
+								if(minBidAmount > newBidAmount){
+									socket.emit("addBid", {"status":403,"msg": "Please increase your bid."});
+									return 0; 	
+								}
+								// bid amount must be divisible by bid increment value 
+								if(newBidAmount % bidIncrement > 0 ){
+									socket.emit("addBid", {"status":403,"msg": "Bid amount must be devisible by bid increment value."}); 	
+									return 0;
+								}
+								
+								
+								
+								
+								// Lets check if auction is still live , time remains and amount is ok and not initial bid 
+								let bidQl = "select b.bid_amount,a.auction_status_id,a.reserve_prie,a.end_date,vma.max  as max_amount,";
+									bidQl +="(select profile_id from bid_max_amount am where am.auction_id = b.auction_id_id ORDER BY max_amount DESC limit 1)as profile_max_id";
+									bidQl +=" from bid b LEFT JOIN auctions a on  b.auction_id_id = a.id LEFT JOIN view_max_bid_amount vma ON vma.auction_id = b.auction_id_id ";
+									bidQl +=" Where a.end_date > now() AND auction_status_id = 1 AND b.bid_type in('2','3') AND b.listing_id_id = "+data.listingId+" AND b.auction_id_id = "+data.auctionId+" order by b.id desc limit 1"
+									// console.log("===Bid Place===>");
+									// console.log(bidQl);
+									
+									//Lets finilize check and put entry
+									pool.query(bidQl, function (err, checkBidRec) {
+								
+									if(err){
+										//if error in sql let log query
+										pool.end(() => {});
+										logger.log("error", 'ERROR QUERY : ' + bidQl);
+										socket.emit("addBid", {"message": "An error occurred that prevented your bid from being placed. Please try again.","status":500});  
+										return 0;
+									}
+									else{
+										
+										// bid found in table and bid status and time remains authentication only. 
+										if(checkBidRec.rowCount > 0){
+											
+											// console.log("===>Inside Final cond");
+											let bidRes = checkBidRec.rows;
+											
+											// console.log(bidRes[0].bid_amount + "<" + data.bidAmount);
+											/** Valid bid amount it is more than last high bid amount */
+											existingHighBid = parseInt(bidRes[0].bid_amount);
+											existingProxyAmount = (bidRes[0].max_amount)?parseInt(bidRes[0].max_amount):0;
+											reservePrice = parseInt(bidRes[0].reserve_prie);
+											exitingHighBidderId =  parseInt(bidRes[0].profile_max_id);
+											
+											/** New bid amount must be greater than exisitng high bid**/
+											if(existingHighBid <= newBidAmount){
+												
+												if(newBidAmount < reservePrice){
+													 //new bid is less than reserve lets use full amount no min bid
+													 bidAmount = newBidAmount;	
+													 maxBidAmount = 0;	
+													 messageStatus = 1;
+												}
+												else if(newBidAmount >= reservePrice && existingHighBid < reservePrice){
+												 	bidAmount = reservePrice;	// set bid upto reserve
+												 	maxBidAmount = newBidAmount; // set bid amount to increse proxy 	
+													messageStatus = 2; // reserve met high bidder			
+												}
+												else{
+												
+													// bidding and proxy logic after reserve met
+													if(existingHighBid === existingProxyAmount){
+														bidAmount = existingHighBid + bidIncrement;
+														maxBidAmount = newBidAmount;
+														messageStatus = 2; // reserve met high bidder
+													}
+													else{
+														
+														/** Let log high proxy amount as newBidAmount */
+														let maxAmtQry = "INSERT INTO bid_max_amount(max_amount, date_added, auction_id, profile_id) ";
+														maxAmtQry += " VALUES("+newBidAmount+", now(), "+data.auctionId+", "+data.profileId+") ";
+														
+														executeQuery(maxAmtQry);
+														/** User is hight bidder and reserve already met then no need to bid for him only increase proxy*/
+														if(exitingHighBidderId === newBidderId){
+															socket.emit("addBid", {"message":"You are the high bidder.","status":200});	
+															return 0;
+														}
+														
+														
+														if(newBidAmount === existingProxyAmount && exitingHighBidderId != newBidderId){
+															// if proxy already set for bid amount New bid amount is audit only bid perhaps
+															if(existingProxyAmount - existingHighBid === bidIncrement){
+																//if one time higher
+																
+																bidAmount = existingProxyAmount;
+																maxBidAmount = 0;
+																messageStatus = 3; //audit only no high bidder
+																// Proxy bid with proxy amount audit only
+																let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																	bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+exitingHighBidderId+", '1')";
+																
+																executeQuery(bidAddQl);
+																
+																profileId = bidRes[0].profile_max_id; 
+																
+																//Proxy bid high bid
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+profileId +", '2')";
+																executeQuery(bidAddQl);
+															}
+															else if((existingProxyAmount - existingHighBid)/bidIncrement === 2){
+																//if two increment higher bid value here we make two entry 
+																/** this bid for new user who lost high bid manual */
+																bidAmount = existingHighBid + bidIncrement;
+																messageStatus = 4; //no high bidder by proxy
+																maxBidAmount = 0;
+																// auto bid status 3	
+																let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																	bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '3')";
+																
+																executeQuery(bidAddQl);
+																
+																/** add another bid for proxy user as proxy*/
+																bidAmount =  existingProxyAmount;
+																bidAddQl = "";
+																// manual bid status 2 
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+exitingHighBidderId+", '2')";
+																executeQuery(bidAddQl);
+															
+															}
+															else{
+																/** Bid amount more than 3 increment */
+																
+																/** this bid for new user who start it */
+																bidAmount = existingHighBid + bidIncrement;
+																messageStatus = 4; //no high bidder by proxy
+																maxBidAmount = 0;
+																// auto bid status 3	
+																let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																	bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '3')";
+																
+																executeQuery(bidAddQl);
+																
+																/** this bid for new user who lost war */
+																bidAmount = existingProxyAmount - bidIncrement;
+																// auto bid status 3	
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '3')";
+																
+																executeQuery(bidAddQl);
+																
+																/** add another bid for proxy user as proxy who won it */
+																bidAmount =  existingProxyAmount;
+																bidAddQl = "";
+																// manual bid status 2 
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+exitingHighBidderId+", '2')";
+																executeQuery(bidAddQl);
+																
+															}
+															
+															
+														}
+														else if(newBidAmount < existingProxyAmount && exitingHighBidderId != newBidderId){
+															
+															bidAmount = existingHighBid + bidIncrement;
+															messageStatus = 4; //no high bidder by proxy
+															maxBidAmount = 0;
+															// auto bid status 3	
+															let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '2')";
+															
+															executeQuery(bidAddQl);
+															
+															if((newBidAmount - existingHighBid)/bidIncrement > 1 ){
+																
+																bidAmount =  newBidAmount;
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '3')";
+															
+																executeQuery(bidAddQl);
+															}
+															
+															
+															
+															bidAmount =  newBidAmount + bidIncrement;
+															
+															bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+ exitingHighBidderId +", '3')";
+															
+															executeQuery(bidAddQl);
+														
+														}
+														else if(newBidAmount > existingProxyAmount && exitingHighBidderId != newBidderId){
+															/** High bidder case as his proxy is more than any other user*/
+															messageStatus = 5; // high bidder by proxy
+															
+															if ((existingProxyAmount - existingHighBid) === bidIncrement) {
+																/** if new bid amount more than proxy and proxy is one increment of high bid */
+																bidAmount = existingProxyAmount;
+																
+																let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+exitingHighBidderId+", '3')";
+																
+																executeQuery(bidAddQl);
+																
+																/** add existing proxy + 1 increment */
+																bidAmount = existingProxyAmount + bidIncrement;
+																
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '2')";
+																
+																executeQuery(bidAddQl);
+																
+																
+															}
+															else if((existingProxyAmount - existingHighBid)/bidIncrement >= 2){
+																/** first bid for new user manual bid*/
+																bidAmount = existingHighBid + bidIncrement;
+																let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '2')";
+																executeQuery(bidAddQl);
+																/** second bid for existing max proxy auto*/
+																bidAmount = existingProxyAmount;
+																
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+exitingHighBidderId+", '3')";
+																executeQuery(bidAddQl);
+																/** last bid for new user max proxy */
+																bidAmount = existingProxyAmount + bidIncrement;
+																bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '3')";
+																executeQuery(bidAddQl);
+																
+															}
+														}	
+													}
+												}
+												
+												/** Query for bidding need single query */
+												
+												if(messageStatus === 1 || messageStatus === 2){
+													bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+													bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '2')";
+													executeQuery(bidAddQl);
+													
+													// If new proxy need to set lets do the same
+													if(maxBidAmount > 0){
+														maxAmtQry = "INSERT INTO bid_max_amount(max_amount, date_added, auction_id, profile_id) ";
+														maxAmtQry += " VALUES("+maxBidAmount+", now(), "+data.auctionId+", "+data.profileId+") ";
+														executeQuery(bidAddQl);
+													}
+													
+													// All is well lets emmit message , send notification if any ...
+													if(messageStatus == 1){
+														socket.emit("addBid", {"message":"You are the high bidder but the reserve has not yet been met.","status":200});	
+													}
+													else if(messageStatus == 2){
+														socket.emit("addBid", {"message":"You are the high bidder.","status":200});		
+													}
+													
+													return true;
+												}
+												
+												
+												if(messageStatus === 4 || messageStatus === 3){
+													socket.emit("addBid", {"message":"Your bid was successfully placed but you are not the current high bidder.","status":201}); 	
+												}
+												else if(messageStatus === 5){
+													socket.emit("addBid", {"message":"You are the high bidder.","status":200});		
+												}
+												return 0;	
+											
+											}
+											else{
+												//return error similar bid amount already placed
+												socket.emit("addBid", {"message":"Another bidder has already placed the same bid just before you. Please increase your bid.","status":403}); 	
+												
+											}
+												
+										}
+										 else{
+											
+											/** no bid found lets check if there are no bid exist in table and date and status is ok*/
+											let noBidSql = "select a.auction_status_id,a.reserve_prie,a.end_date,b.bid_amount";
+												noBidSql += " from auctions a LEFT JOIN bid b on  b.auction_id_id = a.id  Where a.end_date > now() "
+												noBidSql += " AND auction_status_id = 1 AND a.listing_id_id = "+data.listingId+"  AND a.id ="+ data.auctionId 
+												noBidSql += " order by b.bid_amount desc limit 1";
+												
+												pool.query(noBidSql, function (err, noBidRes) {
+													
+													if(err){
+														// pool.end(() => {});
+														logger.log("error", 'ERROR QUERY : ' + noBidSql);
+														socket.emit("addBid", {"message": "An error occurred that prevented your bid from being placed. Please try again.","status":500}); 
+														return 0;
+													}
+													else{
+														
+														
+														
+														if(noBidRes.rowCount > 0){
+															// console.log(noBidRes.rows[0]);
+															let noBidResRec = noBidRes.rows;
+															let bidAmount = parseInt(data.bidAmount);
+																reservePrice = parseInt(noBidResRec[0].reserve_prie)
+																maxBidAmount = parseInt(noBidResRec[0].bid_amount) //Last bid amount
+															//lets place first bid
+															//if bid amount is more than reserve bid for only reserve amount
+															if(bidAmount > reservePrice){
+																maxBidAmount = bidAmount;
+																bidAmount = reservePrice;
+															}
+														
+															let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+																bidAddQl += "VALUES(now(),"+bidAmount+",'1','1', '0',"+data.listingId+","+data.auctionId+","+data.profileId+", '2')";
+																
+															pool.query(bidAddQl,function (err, addBidRes) {
+																if(err){
+																	// pool.end(() => {});
+																	logger.log("error", 'ERROR QUERY : ' + bidAddQl);
+																	socket.emit("addBid", {"message": "An error occurred that prevented your bid from being placed. Please try again.","status":500}); 
+																	return 0;
+																}
+															
+															});
+															//lets check if bid amount is more than reserve set proxy  
+															if(maxBidAmount > 0){
+																let maxAmtQry = "INSERT INTO bid_max_amount(max_amount, date_added, auction_id, profile_id) ";
+																maxAmtQry += " VALUES("+maxBidAmount+", now(), "+data.auctionId+", "+data.profileId+") ";
+																//set max bid amount
+																pool.query(maxAmtQry,function (err, maxBidRes) {
+																	if(err){
+																		// pool.end(() => {});
+																		logger.log("error", 'ERROR QUERY : ' + maxAmtQry);
+																		socket.emit("addBid", {"message": "An error occurred that prevented your bid from being placed. Please try again.","status":500}); 
+																		return 0;
+																	}
+																	
+																});
+															
+															}
+															
+															//As this is first bid emmit high bidder message if reserve not met 
+															if(bidAmount < reservePrice){
+																// bid placed but reserve not met
+																socket.emit("addBid", {"message":"You are the high bidder but the reserve has not yet been met.","status":200});
+															}
+															else{
+																socket.emit("addBid", {"message":"Your $"+convertToDisplayFormat(bidAmount)+" bid was successfully placed, You are the high bidder.","status":200});
+															}
+															
+															
+														}
+														else{
+															//either bid is not in active status or data is over lets emmit error
+															socket.emit("addBid", {"message":"The listing has already ended because either the listing end date has been reached or another user has won the auction.","status":410}); 			
+														}	
+													
+													}	
+												
+											});
+											
+											
+										
+										}
+											
+										
+									}
+										
+									});
+								
+								
+							
+							}//user validation
+							
+							
+							//Once bid placed then check max bid amount table for proxy and put proxy bid 
+							//where profile is other than current user 	
+							
+							
+						}
+					
+					
+					});
+			}
+				catch(err){
+					 //trapped error
+					  logger.log("error", 'ERROR : ' + err.message);
+					  socket.emit("bidHistory",{"message":err.message,"status":500});
+					  return 0;
+				 }
+		
+		}
+		else{
+				socket.emit("addBid", {'message': 'Invalid request.','status':403});	
+			}
+	},
+	bidHistory: function bidHistory(socket, data){
+		/**
+		 * This is listner function to update bid history during live 
+		 * bid process. 
+		 * requrest parameter:
+		 * 			listing_id: as integer
+		 * 			auction_id:	as integer
+		 * response:
+		 * 		 db object as json			
+		 */	
+		
+		 if(parseInt(data.auctionId) > 0 && parseInt(data.listingId) > 0){
+			 // console.log("==Inside=>>");
+			 let historyQl = "SELECT bidder_rand_name, bid_date,";
+			 historyQl +=" bid_amount, bid_type from view_bid_history ";
+			 historyQl +=" WHERE auction_id = "+data.auctionId ;
+			 historyQl +=" AND listing_id = "+data.listingId ;
+			 console.log(historyQl);
+			 
+			 try {
+				 pool.query(historyQl, function (err, historyRes) {
+					 if(err){
+						 //log query and exit
+						 // pool.end(() => {});
+						 logger.log("error", 'ERROR QUERY : ' + historyQl);
+						 socket.emit("checkBid", {"ERROR": err});
+						 return 0;
+					 }
+					 else{
+						if(historyRes.rowCount){
+							socket.emit("bidHistory", {"result": historyRes.rows,"status": 200});
+						}
+						else{
+							socket.emit("bidHistory", {"message":"No history record found" ,"status": 404});
+						}
+						return 0;
+					 }
+				 });
+				 
+			 }
+			 catch(err){
+				 //trapped error
+				  logger.log("error", 'ERROR : ' + err.message);
+				  socket.emit("bidHistory",{"message":err.message,"status":500});
+				  return 0;
+			 }
+		 
+		 }
+		 else{
+			//required parameter not found 
+			logger.log("error", 'ERROR : Missing requered parameter');
+			socket.emit("bidHistory",{"message":"Forbidden.","status":403});	
+			return 0;
+		 }
+		 	
+	
+	}
+}
+/**
+ * This js funciton display number with thousand separator  
+ */
+function convertToDisplayFormat(num)
+{
+    var removeTrailingZero = parseFloat(num).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    removeTrailingZero = removeTrailingZero.replace('.00','');
+    return removeTrailingZero;
+ }
+ 
+ /**
+  * Post Proxy bidding, Fucntion call recurssivly and place desired bid
+  * automatically if there are high bid exists in system. This function 
+  * take three parameter. 
+  * 1. Bid increment value
+  * 2. Current successfull placed bid amount
+  * 3. Listing Id 
+  * 4. Auction Id and
+  * 5. Profile Id
+  * Proxy bid shall always equals to last bid + bid increment 
+  * if single max bid amount exists and last bid placed by user
+  * other than max bid amount owner 
+  */
+function placeProxyBid(incrementVal, bidAmt, listId, auctionId, profileId)
+{
+	
+	if(incrementVal > 0 && bidAmt > 0 && listId > 0 && auctionId > 0){
+		try {
+			/** First we list all max amount > bid amount and profile id
+			 *  where listing id and auction id is same; 
+			 * this query get all user and max amount placed more than
+			 * bid amount. 
+			 * sort order first by amount then timestamp this measn 
+			 * two user with same amount set first user get priority over
+			 * next user.
+			 */ 
+			
+			let maxAmtQl = "SELECT max_amount, profile_id";
+			maxAmtQl += " FROM bid_max_amount";
+			maxAmtQl += " WHERE auction_id ="+ auctionId ;
+			maxAmtQl += " AND max_amount >="+ bidAmt ;
+			maxAmtQl += " ORDER BY max_amount DESC, date_added ASC";
+			
+			pool.query(maxAmtQl, function (err, maxAmtRes) {
+			
+			if(err){
+				 //log query and exit
+				 // pool.end();
+				 logger.log("error", 'ERROR QUERY : ' + maxAmtQl);
+				 return 0;
+			 }
+			 else if(maxAmtRes.rowCount === 0){
+				 //No higher max amount found let do nothing
+				 return 0;
+			 }
+			 else{
+				 const res = maxAmtRes.rows;
+				 let maxBidVal = [];
+				 let maxRecord = [];
+				//Lets check record and record proxy bidding type id 3
+				
+				res.forEach(rec =>{
+					//console.log(rec.profile_id + "===>>"+rec.max_amount+"==>"+bidAmt);
+					//Lets ensure each profile have unique max amount value
+					maxRecord =[rec.profile_id,rec.max_amount];
+					maxBidVal.push(maxRecord);
+					
+				});
+				console.log(maxBidVal);
+				
+				// if there are only high bid amount let post a auto proxy bid for that 
+				
+				if(parseInt(maxBidVal.length) === 1 && parseInt(maxBidVal[0][0]) != parseInt(profileId) && parseInt(maxBidVal[0][1]) > parseInt(bidAmt) ){
+					/** For single highbid user lets outbid previous user and set high bid to true for other user
+					* If highest bid amount set by last user itself lets do nothing  
+					*/
+					let minBidAmt = parseInt(bidAmt) + parseInt(incrementVal);
+					
+					let bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+					bidAddQl += "VALUES(now(),"+minBidAmt+",'1','1', '0',"+listId+","+auctionId+","+maxBidVal[0][0]+", '3')";
+					
+					executeQuery(bidAddQl);
+				}
+				else{
+					/** Top list means user is hightest bid amount user 
+					 * below top other will loose proxy
+					 * if more than one and amount is same only first profile will bid as proxy 
+					 * other become audit only bid
+					 * exclude same profile in list
+					 */ 
+					 let i = 0;
+					 let maxVal = maxAmtRes.rowCount;
+					 let bidStatus = "3";
+					 let proxyWinAmount = 0;
+					 let bidAddQl = ""
+					 
+					 for(i = 1; i < maxVal ; i++){
+						 //check if next amount is eqal or less than previous one
+						 console.log("Counter val===>" + i);
+						 bidStatus = (parseInt(maxBidVal[i][1]) == parseInt(maxBidVal[i - 1][1]))?'1':'3'; // if previous amount is equal then this bid is audit only 
+						 
+						 bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+						 bidAddQl += "VALUES(now(),"+maxBidVal[i][1]+",'0','1', '0',"+listId+","+auctionId+","+maxBidVal[i][0]+", "+bidStatus+")";
+						 console.log(bidAddQl);
+						 executeQuery(bidAddQl);
+						 
+					 }
+					 /**
+					  * Check if second last bid amount + bid increment is greater than 
+					  * top bid amount set else set top as high bid 
+					  * new bid amount either last bid + bid increment or last bid amount as two user have 
+					  * set same max bid amount in this case the user came first 
+					  * consider winner 
+					  */
+					 proxyWinAmount = (parseInt(maxBidVal[0][1]) > parseInt(maxBidVal[1][1]))? parseInt(maxBidVal[1][1]) + parseInt(incrementVal):maxBidVal[1][1];
+					 
+					 bidAddQl = "INSERT into bid (bid_date,bid_amount,highest_bid,user_qualify,is_canceled, listing_id_id, auction_id_id, profile_id_id, bid_type)";
+					 bidAddQl += "VALUES(now(),"+ proxyWinAmount +",'1','1', '0',"+listId+","+auctionId+","+maxBidVal[0][0]+", '2')";
+					 console.log(bidAddQl);
+					 executeQuery(bidAddQl);
+					 return 0;
+					
+				}
+				
+			 }
+				
+			});
+		}
+		catch(err){
+			logger.log("error", 'ERROR : ' + err.message);
+			socket.emit("bidHistory",{"message":err.message,"status":500});
+			return 0;
+		}
+	} 
+  
+}
+
+function executeQuery(sql){
+	if(sql){
+		
+		try{	
+			pool.query(sql, function (err, result) {
+			if(err){
+			 //log query and exit
+			 // pool.end(() => {});
+			 logger.log("error", 'ERROR BID QUERY : ' + chkQry);
+			 socket.emit("checkBid", {"ERROR": err});
+			 return 0;
+			}
+			else{
+				return "ok";
+			}
+			});
+		}
+		catch(err){
+			logger.log("error", 'BID ERROR : ' + err.message);
+			return 0;
+		}	
+	}
+}
